@@ -296,6 +296,9 @@ The lookup stops at the repository root. Only `bank_id` is read.
 | `retain_cron` | `false` | Also auto-retain scheduled (cron) runs. Off by default, so job output stays out of the user's memory; the `hindsight_retain` tool still works in cron runs. |
 | `retain_async` | `true` | Process retain asynchronously on the Hindsight server |
 | `retain_every_n_turns` | `1` | Retain every N turns (1 = every turn) |
+| `retain_reply_context_chars` | `0` | Off by default. When a short user reply (see below) is the first turn of a retain batch, quote up to N chars of the previous assistant reply (head + tail) into it: `User (replying to Assistant: «…»): option 1`. That reply's antecedent went out in the previous append, so extraction would otherwise see "option 1" / "yes, go ahead" without its referent. Inside a batch the antecedent is adjacent and nothing is quoted. No extra LLM call; the assistant reply is still stored once. |
+| `retain_reply_short_chars` | `300` | A user reply up to this many characters counts as short. |
+| `retain_reply_context_label` | `replying to` | Words between the two prefixes in the quote (e.g. `in risposta a` for an Italian bank). |
 | `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
 | `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags. JSON list or comma-separated text. |
 | `observation_scopes` | `shared` | How observations are grouped by tag during consolidation: `shared` (one scope for the whole bank, so observations merge across sessions; the `session:`/`parent:` tags stay on the facts for filtering), `combined` (one scope per exact tag set, which here means one per session), `per_tag` (one pass per tag), `all_combinations` (every tag subset, expensive), or a JSON list of tag lists for custom scopes (e.g. `[["user:alice"], ["project-x"]]`). |

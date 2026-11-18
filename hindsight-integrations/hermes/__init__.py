@@ -567,6 +567,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._turn_counter = self._turn_index = 0
         self._session_turns: list[str] = []  # ALL turns for the session
         self._last_retained_turn_count = 0  # append-mode delta watermark
+        # Last assistant reply, quoted into the next user turn when that turn is a short reply opening
+        # a new retain batch (``retain_reply_context_chars``): its antecedent already left in the
+        # previous append, so extraction would otherwise see "option 1" / "yes, go" with no referent.
+        self._last_assistant_content = ""
         # Server-side async retain ops still in flight: aretain_batch returns on
         # *acceptance*, not durability, so the prefetch gates on these via
         # get_operation_status (a drained local queue is not a read-after-write signal).
@@ -841,6 +845,21 @@ class HindsightMemoryProvider(MemoryProvider):
                 "default": False,
             },
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
+            {
+                "key": "retain_reply_context_chars",
+                "description": "Quote up to N chars of the previous assistant reply into a short user reply that opens a retain batch (0 = off)",
+                "default": 0,
+            },
+            {
+                "key": "retain_reply_short_chars",
+                "description": "A user reply up to N chars counts as short",
+                "default": 300,
+            },
+            {
+                "key": "retain_reply_context_label",
+                "description": "Words between the two prefixes in the quote",
+                "default": "replying to",
+            },
             {
                 "key": "retain_async",
                 "description": "Process retain asynchronously on the Hindsight server",
@@ -1544,6 +1563,10 @@ class HindsightMemoryProvider(MemoryProvider):
         skip = context in ("subagent", "kanban") or (context == "cron" and not cfg.get("retain_cron", False))
         self._auto_retain = bool(cfg.get("auto_retain", True)) and not skip
         self._retain_every_n_turns = max(1, _parse_int_setting(cfg.get("retain_every_n_turns"), 1))
+        # Reply context (0 = off): see _reply_context().
+        self._reply_context_chars = max(0, _parse_int_setting(cfg.get("retain_reply_context_chars"), 0))
+        self._reply_short_chars = max(1, _parse_int_setting(cfg.get("retain_reply_short_chars"), 300))
+        self._reply_context_label = str(cfg.get("retain_reply_context_label") or "replying to").strip()
         self._retain_context = cfg.get("retain_context", _RETAIN_CONTEXT_DEFAULT)
         self._retain_async = cfg.get("retain_async", True)
         # On by default so the user SEES memory working whether or not the model
@@ -1845,12 +1868,38 @@ class HindsightMemoryProvider(MemoryProvider):
 
     # -- retain ------------------------------------------------------------------
 
-    def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
+    def _reply_context(self, user_content: str) -> str:
+        """Excerpt of the previous assistant reply for a SHORT user reply opening a batch, else "".
+
+        Head + tail of the previous reply (options are usually listed first, questions asked last),
+        capped at ``retain_reply_context_chars`` so the user message still fits one chunk.
+
+        Only for the FIRST turn of a retain batch: there the replied-to message already left in the
+        previous batch. Inside a batch it sits right before the reply, so quoting it would only give
+        the extractor a second copy to restate (measured: +duplicates, +cost)."""
+        prev, limit = self._last_assistant_content, self._reply_context_chars
+        if not limit or not prev or len((user_content or "").strip()) > self._reply_short_chars:
+            return ""
+        if self._turn_counter % self._retain_every_n_turns:  # not the first turn of a batch
+            return ""
+        if len(prev) <= limit:
+            return prev
+        head = int(limit * 0.4)
+        return f"{prev[:head]} … {prev[-(limit - head) :]}"
+
+    def _build_turn_messages(
+        self, user_content: str, assistant_content: str, reply_to: str = ""
+    ) -> List[Dict[str, str]]:
         now = _event_timestamp()  # one turn -> both messages share the event timestamp
+        user_prefix = (
+            f"{self._retain_user_prefix} ({self._reply_context_label} {self._retain_assistant_prefix}: «{reply_to}»)"
+            if reply_to
+            else self._retain_user_prefix
+        )
         return [
             {"role": role, "content": f"{prefix}: {content}", "timestamp": now}
             for role, prefix, content in (
-                ("user", self._retain_user_prefix, user_content),
+                ("user", user_prefix, user_content),
                 ("assistant", self._retain_assistant_prefix, assistant_content),
             )
         ]
@@ -2021,8 +2070,12 @@ class HindsightMemoryProvider(MemoryProvider):
             self._session_id = str(session_id).strip()
 
         self._session_turns.append(
-            json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
+            json.dumps(
+                self._build_turn_messages(user_content, assistant_content, reply_to=self._reply_context(user_content)),
+                ensure_ascii=False,
+            )
         )
+        self._last_assistant_content = assistant_content or ""
         self._turn_counter = self._turn_index = self._turn_counter + 1
         if remainder := self._turn_counter % self._retain_every_n_turns:
             logger.debug(
@@ -2219,6 +2272,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._bank_id = self._resolve_template_bank()
             self._write_bank_ids = self._build_write_bank_ids()
         self._session_turns = []
+        self._last_assistant_content = ""  # never quote another session's reply
         self._turn_counter = self._turn_index = self._last_retained_turn_count = 0
         logger.debug(
             "Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
